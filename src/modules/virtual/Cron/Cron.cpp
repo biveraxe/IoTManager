@@ -14,6 +14,10 @@ class Cron : public IoTItem {
     cron_expr _expr;
     time_t _nextAlarm = 0;
     bool _isInit = false;
+    int _tzOffset = 0;  // часовой пояс, с которым посчитан _nextAlarm
+    unsigned long _lastUnixTime = 0;  // unixTime на прошлом тике, для обнаружения отката часов
+
+    int getTzOffset() { return jsonReadInt(settingsFlashJson, F("timezone")); }
 
    public:
     Cron(String parameters): IoTItem(parameters) {
@@ -40,6 +44,7 @@ class Cron : public IoTItem {
             if (forced || (_nextAlarm <= gmtTimeToLocal(unixTime))) {
                 // update alarm if next trigger is not yet in the future
                 _nextAlarm = cron_next(&_expr, gmtTimeToLocal(unixTime));
+                _tzOffset = getTzOffset();
                 _isInit = true;
             }
         }
@@ -78,8 +83,23 @@ class Cron : public IoTItem {
     }
 
     void doByInterval() {
-        if (!_isInit && _time_isTrust) initCron();
-        if (!_pause && _time_isTrust && (gmtTimeToLocal(unixTime) >= _nextAlarm)) {
+        if (!_time_isTrust) return;
+        if (!_isInit) initCron();
+        // часовой пояс сменился или часы откатились назад (NTP, ручная установка) -
+        // пересчитываем следующую сработку без генерации события.
+        // Скачок вперёд не обрабатываем: пропущенная сработка выполнится один раз вдогонку
+        bool tzChanged = _tzOffset != getTzOffset();
+        bool timeBack = _lastUnixTime != 0 && unixTime + 60 < _lastUnixTime;
+        _lastUnixTime = unixTime;
+        if (_isInit && !_pause && (tzChanged || timeBack)) {
+            SerialPrint("i", "Cron", tzChanged ? F("Timezone changed, recalculating next alarm") : F("Time moved back, recalculating next alarm"), _id);
+            updateNextAlarm(true);
+            bool _needSaveBak = _needSave;
+            _needSave = false;
+            regEvent(getNextAlarmF(), F("Cron alarm"), false, false);
+            _needSave = _needSaveBak;
+        }
+        if (!_pause && (gmtTimeToLocal(unixTime) >= _nextAlarm)) {
             updateNextAlarm(true);
             bool _needSaveBak = _needSave;
             _needSave = false;
